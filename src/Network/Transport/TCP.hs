@@ -1212,6 +1212,9 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
           RemoteEndPointValid vst -> do
             -- Release probing resources if probing.
             forM_ (remoteProbing vst) id
+            -- Enqueue ConnectionClosed events for all incoming connections.
+            forM_ (Set.elems $ vst ^. remoteIncoming) $
+              qdiscEnqueue' ourQueue theirAddr . ConnectionClosed . connId
             let code = EventConnectionLost (remoteAddress theirEndPoint) (remoteId theirEndPoint)
             qdiscEnqueue' ourQueue theirAddr . ErrorEvent $ TransportError code (show err)
             return (RemoteEndPointFailed err)
@@ -1721,11 +1724,18 @@ runScheduledAction (ourEndPoint, theirEndPoint) mvar = do
     handleIOException ex vst = do
       -- Release probing resources if probing.
       forM_ (remoteProbing vst) id
+      -- Enqueue ConnectionClosed events for all incoming connections.
+      forM_ (Set.elems $ vst ^. remoteIncoming) $
+        qdiscEnqueue' (localQueue ourEndPoint) (remoteAddress theirEndPoint) . ConnectionClosed . connId
       tryCloseSocket (remoteSocket vst)
       let code     = EventConnectionLost (remoteAddress theirEndPoint) (remoteId theirEndPoint)
           err      = TransportError code (show ex)
       qdiscEnqueue' (localQueue ourEndPoint) (localAddress ourEndPoint) $ ErrorEvent err
       return (RemoteEndPointFailed ex)
+
+    -- Construct a connection ID
+    connId :: LightweightConnectionId -> ConnectionId
+    connId = createConnectionId (remoteId theirEndPoint)
 
 -- | Use 'schedule' action 'runScheduled' action in a safe way, it's assumed that
 -- callback is used only once, otherwise guarantees of runScheduledAction are not
