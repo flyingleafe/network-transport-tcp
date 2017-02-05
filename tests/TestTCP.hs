@@ -115,7 +115,7 @@ testEarlyDisconnect = do
         ConnectionOpened _ _ addr <- receive endpoint
         True <- return $ addr == theirAddr
 
-        ErrorEvent (TransportError (EventConnectionLost addr') _) <- receive endpoint
+        ErrorEvent (TransportError (EventConnectionLost addr' _) _) <- receive endpoint
         True <- return $ addr' == theirAddr
 
         return ()
@@ -138,7 +138,7 @@ testEarlyDisconnect = do
         Received cid' ["pong"] <- receive endpoint
         True <- return $ cid == cid'
 
-        ErrorEvent (TransportError (EventConnectionLost addr') _) <- receive endpoint
+        ErrorEvent (TransportError (EventConnectionLost addr' _) _) <- receive endpoint
         True <- return $ addr' == theirAddr
 
         return ()
@@ -244,7 +244,7 @@ testEarlyCloseSocket = do
         ConnectionClosed cid'' <- receive endpoint
         True <- return $ cid'' == cid
 
-        ErrorEvent (TransportError (EventConnectionLost addr') _) <- receive endpoint
+        ErrorEvent (TransportError (EventConnectionLost addr' _) _) <- receive endpoint
         True <- return $ addr' == theirAddr
 
         return ()
@@ -635,7 +635,7 @@ testReconnect = do
           Left _ -> return ()
           Right _ -> throwIO $ userError "testConnect: unexpected send success"
 
-    ErrorEvent (TransportError (EventConnectionLost _) _) <- receive endpoint
+    ErrorEvent (TransportError (EventConnectionLost _ _) _) <- receive endpoint
 
     -- The third attempt succeeds
     Right conn1 <- connect endpoint theirAddr ReliableOrdered defaultConnectHints
@@ -703,7 +703,7 @@ testUnidirectionalError = do
 
     -- But when we send we find the error
     Left (TransportError SendFailed _) <- send conn1 ["ping"]
-    ErrorEvent (TransportError (EventConnectionLost _) _) <- receive endpoint
+    ErrorEvent (TransportError (EventConnectionLost _ _) _) <- receive endpoint
 
     -- A call to connect should now re-establish the connection
     Right conn2 <- connect endpoint theirAddr ReliableOrdered defaultConnectHints
@@ -717,7 +717,7 @@ testUnidirectionalError = do
     -- We now find the error when we attempt to close the connection
     Nothing <- timeout 500000 $ receive endpoint
     close conn2
-    ErrorEvent (TransportError (EventConnectionLost _) _) <- receive endpoint
+    ErrorEvent (TransportError (EventConnectionLost _ _) _) <- receive endpoint
     Right conn3 <- connect endpoint theirAddr ReliableOrdered defaultConnectHints
     send conn3 ["ping"]
     takeMVar serverGotPing
@@ -729,7 +729,7 @@ testUnidirectionalError = do
     -- Now we notice the problem when we try to connect
     Nothing <- timeout 500000 $ receive endpoint
     Left (TransportError ConnectFailed _) <- connect endpoint theirAddr ReliableOrdered defaultConnectHints
-    ErrorEvent (TransportError (EventConnectionLost _) _) <- receive endpoint
+    ErrorEvent (TransportError (EventConnectionLost _ _) _) <- receive endpoint
     Right conn4 <- connect endpoint theirAddr ReliableOrdered defaultConnectHints
     send conn4 ["ping"]
     takeMVar serverGotPing
@@ -754,7 +754,7 @@ testInvalidCloseConnection = do
 
     -- At this point the client sends an invalid request, so we terminate the
     -- connection
-    ErrorEvent (TransportError (EventConnectionLost _) _) <- receive endpoint
+    ErrorEvent (TransportError (EventConnectionLost _ _) _) <- receive endpoint
 
     putMVar serverDone ()
 
