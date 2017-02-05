@@ -122,6 +122,7 @@ testEarlyDisconnect = do
         ConnectionOpened _ _ addr <- receive endpoint
         True <- return $ addr == theirAddr
 
+        ConnectionClosed _ <- receive endpoint
         ErrorEvent (TransportError (EventConnectionLost addr') _) <- receive endpoint
         True <- return $ addr' == theirAddr
 
@@ -145,6 +146,8 @@ testEarlyDisconnect = do
         Received cid' ["pong"] <- receive endpoint
         True <- return $ cid == cid'
 
+        ConnectionClosed cid' <- receive endpoint
+        True <- return $ cid' == cid
         ErrorEvent (TransportError (EventConnectionLost addr') _) <- receive endpoint
         True <- return $ addr' == theirAddr
 
@@ -793,6 +796,7 @@ testInvalidCloseConnection = do
 
     -- At this point the client sends an invalid request, so we terminate the
     -- connection
+    ConnectionClosed _ <- receive endpoint
     ErrorEvent (TransportError (EventConnectionLost _) _) <- receive endpoint
 
     putMVar serverDone ()
