@@ -436,6 +436,11 @@ data ValidRemoteEndPointState = ValidRemoteEndPointState
      -- used to release any resources dedicated to the probing.
   ,  remoteProbing       :: Maybe (IO ())
   ,  remoteSendLock      :: !(MVar ())
+     -- | An IO which returns when the socket (remoteSocket) has been closed.
+     --   The program/thread which created the socket is always responsible
+     --   for closing it, but sometimes other threads need to know when this
+     --   happens.
+  ,  remoteSocketClosed  :: !(IO ())
   }
 
 -- | Local identifier for an endpoint within this transport
@@ -822,6 +827,12 @@ apiCloseEndPoint transport evs ourEndPoint =
             putMVar resolved ()
             return closed
           RemoteEndPointValid vst -> do
+            -- Schedule an action to send a CloseEndPoint message and then
+            -- wait for the socket to actually close (meaning that this
+            -- end point is no longer receiving from it).
+            -- Since we replace the state in this MVar with 'closed', it's
+            -- guaranteed that no other actions will be scheduled after this
+            -- one.
             sched theirEndPoint $ do
               void $ tryIO $ sendOn vst
                 [ encodeWord32 (encodeControlHeader CloseEndPoint) ]
@@ -830,13 +841,17 @@ apiCloseEndPoint transport evs ourEndPoint =
               -- Post ConnectionClosed for every connection.
               forM_ (Set.elems $ vst ^. remoteIncoming) $
                 qdiscEnqueue' (localQueue ourEndPoint) (remoteAddress theirEndPoint) . ConnectionClosed . createConnectionId (remoteId theirEndPoint)
-              tryCloseSocket (remoteSocket vst)
             return closed
           RemoteEndPointClosing resolved vst -> do
             -- Release probing resources if probing.
             forM_ (remoteProbing vst) id
             putMVar resolved ()
-            sched theirEndPoint $ tryCloseSocket (remoteSocket vst)
+            -- Schedule an action to wait for the socket to actually close (this
+            -- end point is no longer receiving from it).
+            -- Since we replace the state in this MVar with 'closed', it's
+            -- guaranteed that no other actions will be scheduled after this
+            -- one.
+            sched theirEndPoint $ remoteSocketClosed vst
             return closed
           RemoteEndPointClosed ->
             return st
@@ -859,8 +874,8 @@ apiCloseEndPoint transport evs ourEndPoint =
 -- the transport down. We must be careful to close the socket when a (possibly
 -- asynchronous, ThreadKilled) exception occurs. (If an exception escapes from
 -- handleConnectionRequest the transport will be shut down.)
-handleConnectionRequest :: TCPTransport -> N.Socket -> IO ()
-handleConnectionRequest transport sock = handle handleException $ do
+handleConnectionRequest :: TCPTransport -> IO () -> N.Socket -> IO ()
+handleConnectionRequest transport socketClosed sock = handle handleException $ do
     when (tcpNoDelay $ transportParams transport) $
       N.setSocketOption sock N.NoDelay 1
     when (tcpKeepAlive $ transportParams transport) $
@@ -882,7 +897,7 @@ handleConnectionRequest transport sock = handle handleException $ do
             return ourEndPoint
       TransportClosed ->
         throwIO $ userError "Transport closed"
-    void . forkIO $ go ourEndPoint theirAddress
+    void $ go ourEndPoint theirAddress
   where
     go :: LocalEndPoint -> EndPointAddress -> IO ()
     go ourEndPoint theirAddress = do
@@ -897,12 +912,12 @@ handleConnectionRequest transport sock = handle handleException $ do
             void $ tryIO $ sendMany sock
               [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestCrossed)]
             probeIfValid theirEndPoint
-            tryCloseSocket sock
             return Nothing
           else do
             sendLock <- newMVar ()
             let vst = ValidRemoteEndPointState
                         {  remoteSocket        = sock
+                        ,  remoteSocketClosed  = socketClosed
                         ,  remoteProbing       = Nothing
                         ,  remoteSendLock      = sendLock
                         , _remoteOutgoing      = 0
@@ -922,7 +937,6 @@ handleConnectionRequest transport sock = handle handleException $ do
 
     handleException :: SomeException -> IO ()
     handleException ex = do
-      tryCloseSocket sock
       rethrowIfAsync (fromException ex)
 
     rethrowIfAsync :: Maybe AsyncException -> IO ()
@@ -946,7 +960,6 @@ handleConnectionRequest transport sock = handle handleException $ do
               --
               -- The thread handling incoming messages will detect the socket is
               -- closed and will report the failure upwards.
-              tryCloseSocket (remoteSocket vst)
               -- Waiting the probe ack and closing the socket is only needed in
               -- platforms where TCP_USER_TIMEOUT is not available or when the
               -- user does not set it. Otherwise the ack would be handled at the
@@ -1031,7 +1044,6 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
                   putMVar resolved ()
                   return RemoteEndPointClosed
                 _                           -> return s
-              tryCloseSocket sock
             Just ProbeSocket -> do
               forkIO $ sendMany sock [encodeWord32 (encodeControlHeader ProbeSocketAck)]
               go sock
@@ -1143,7 +1155,6 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
                     [ encodeWord32 (encodeControlHeader CloseSocket)
                     , encodeWord32 (vst ^. remoteMaxIncoming)
                     ]
-                  tryCloseSocket sock
                 return (RemoteEndPointClosed, Just act)
           RemoteEndPointClosing resolved vst ->  do
             -- Like above, we need to check if there is a ConnectionCreated
@@ -1160,9 +1171,8 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
                 -- Release probing resources if probing.
                 forM_ (remoteProbing vst) id
                 removeRemoteEndPoint (ourEndPoint, theirEndPoint)
-                act <- schedule theirEndPoint $ tryCloseSocket sock
                 putMVar resolved ()
-                return (RemoteEndPointClosed, Just act)
+                return (RemoteEndPointClosed, Nothing)
           RemoteEndPointFailed err ->
             throwIO err
           RemoteEndPointClosed ->
@@ -1198,7 +1208,6 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
     -- Deal with a premature exit
     prematureExit :: N.Socket -> IOException -> IO ()
     prematureExit sock err = do
-      tryCloseSocket sock
       modifyMVar_ theirState $ \st ->
         case st of
           RemoteEndPointInvalid _ ->
@@ -1339,10 +1348,17 @@ setupRemoteEndPoint params (ourEndPoint, theirEndPoint) connTimeout = do
                                (tcpUserTimeout params)
                                connTimeout
     didAccept <- case result of
-      Right (sock, ConnectionRequestAccepted) -> do
+      -- Since a socket was created, we are now responsible for closing it.
+      --
+      -- In case the connection was accepted, we have some work to do.
+      -- We'll remember how to wait for the socket to close
+      -- (readMVar socketClosedVar), and we'll take care of closing it up
+      -- once handleIncomingMessages has finished.
+      Right (socketClosedVar, sock, ConnectionRequestAccepted) -> do
         sendLock <- newMVar ()
         let vst = ValidRemoteEndPointState
                     {  remoteSocket        = sock
+                    ,  remoteSocketClosed  = readMVar socketClosedVar
                     ,  remoteProbing       = Nothing
                     ,  remoteSendLock      = sendLock
                     , _remoteOutgoing      = 0
@@ -1351,13 +1367,14 @@ setupRemoteEndPoint params (ourEndPoint, theirEndPoint) connTimeout = do
                     , _remoteNextConnOutId = firstNonReservedLightweightConnectionId
                     }
         resolveInit (ourEndPoint, theirEndPoint) (RemoteEndPointValid vst)
-        return True
-      Right (sock, ConnectionRequestInvalid) -> do
+        return (Just (socketClosedVar, sock))
+      -- If it's an invalid request, we can close up right away.
+      Right (socketClosedVar, sock, ConnectionRequestInvalid) -> do
         let err = invalidAddress "setupRemoteEndPoint: Invalid endpoint"
         resolveInit (ourEndPoint, theirEndPoint) (RemoteEndPointInvalid err)
-        tryCloseSocket sock
-        return False
-      Right (sock, ConnectionRequestCrossed) -> do
+        tryCloseSocket sock `finally` putMVar socketClosedVar ()
+        return Nothing
+      Right (socketClosedVar, sock, ConnectionRequestCrossed) -> do
         withMVar (remoteState theirEndPoint) $ \st -> case st of
           RemoteEndPointInit _ crossed _ ->
             putMVar crossed ()
@@ -1365,15 +1382,19 @@ setupRemoteEndPoint params (ourEndPoint, theirEndPoint) connTimeout = do
             throwIO ex
           _ ->
             relyViolation (ourEndPoint, theirEndPoint) "setupRemoteEndPoint: Crossed"
-        tryCloseSocket sock
-        return False
+        tryCloseSocket sock `finally` putMVar socketClosedVar ()
+        return Nothing
       Left err -> do
         resolveInit (ourEndPoint, theirEndPoint) (RemoteEndPointInvalid err)
-        return False
+        return Nothing
 
-    when didAccept $ void $ forkIO $
+    -- We handle incoming messages in a separate thread, and are careful to
+    -- always close the socket once that thread is finished.
+    forM_ didAccept $ \(socketClosed, sock) -> void $ forkIO $
       handleIncomingMessages (ourEndPoint, theirEndPoint)
-    return $ either (const Nothing) (Just . snd) result
+      `finally`
+      (tryCloseSocket sock `finally` putMVar socketClosed ())
+    return $ either (const Nothing) (Just . (\(_,_,x) -> x)) result
   where
     ourAddress      = localAddress ourEndPoint
     theirAddress    = remoteAddress theirEndPoint
@@ -1728,7 +1749,6 @@ runScheduledAction (ourEndPoint, theirEndPoint) mvar = do
       -- Enqueue ConnectionClosed events for all incoming connections.
       forM_ (Set.elems $ vst ^. remoteIncoming) $
         qdiscEnqueue' (localQueue ourEndPoint) (remoteAddress theirEndPoint) . ConnectionClosed . connId
-      tryCloseSocket (remoteSocket vst)
       let code     = EventConnectionLost (remoteAddress theirEndPoint) (remoteId theirEndPoint)
           err      = TransportError code (show ex)
       qdiscEnqueue' (localQueue ourEndPoint) (localAddress ourEndPoint) $ ErrorEvent err
@@ -1754,6 +1774,11 @@ withScheduledAction ourEndPoint f =
 -- | Establish a connection to a remote endpoint
 --
 -- Maybe throw a TransportError
+--
+-- If a socket is created and returned (Right is given) then the caller is
+-- responsible for eventually closing the socket and filling the MVar (which
+-- is empty). The MVar must be filled immediately after, and never before,
+-- the socket is closed.
 socketToEndPoint :: EndPointAddress -- ^ Our address
                  -> EndPointAddress -- ^ Their address
                  -> Bool            -- ^ Use SO_REUSEADDR?
@@ -1762,7 +1787,7 @@ socketToEndPoint :: EndPointAddress -- ^ Our address
                  -> Maybe Int       -- ^ Maybe TCP_USER_TIMEOUT
                  -> Maybe Int       -- ^ Timeout for connect
                  -> IO (Either (TransportError ConnectErrorCode)
-                               (N.Socket, ConnectionRequestResponse))
+                               (MVar (), N.Socket, ConnectionRequestResponse))
 socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay keepAlive
                  mUserTimeout timeout =
   try $ do
@@ -1789,7 +1814,9 @@ socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay kee
           recvWord32 sock
       case decodeConnectionRequestResponse response of
         Nothing -> throwIO (failed . userError $ "Unexpected response")
-        Just r  -> return (sock, r)
+        Just r  -> do
+          socketClosedVar <- newEmptyMVar
+          return (socketClosedVar, sock, r)
   where
     createSocket :: N.AddrInfo -> IO N.Socket
     createSocket addr = mapIOException insufficientResources $
