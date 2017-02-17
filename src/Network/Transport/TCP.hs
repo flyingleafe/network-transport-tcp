@@ -59,6 +59,7 @@ import Network.Transport.TCP.Internal
   , recvWord32
   , encodeWord32
   , tryCloseSocket
+  , tryShutdownSocketBoth
   )
 import Network.Transport.Internal
   ( prependLength
@@ -552,7 +553,7 @@ createTransportExposeInternals bindHost bindPort mkExternal params = do
                              (tcpBacklog params)
                              (tcpReuseServerAddr params)
                              (terminationHandler transport)
-                             (handleConnectionRequest transport))
+                             (Right (handleConnectionRequest transport)))
                       (\(_port', tid) -> killThread tid)
                       (\(port'', tid) -> (port'',) <$> mkTransport transport tid)
        return result
@@ -1169,7 +1170,10 @@ handleIncomingMessages (ourEndPoint, theirEndPoint) = do
                 forM_ (remoteProbing vst) id
                 removeRemoteEndPoint (ourEndPoint, theirEndPoint)
                 putMVar resolved ()
-                return (RemoteEndPointClosed, Nothing)
+                -- Nothing to do, but we want to indicate that the socket
+                -- really did close.
+                act <- schedule theirEndPoint $ return ()
+                return (RemoteEndPointClosed, Just act)
           RemoteEndPointFailed err ->
             throwIO err
           RemoteEndPointClosed ->
@@ -1739,6 +1743,9 @@ runScheduledAction (ourEndPoint, theirEndPoint) mvar = do
     handleIOException ex vst = do
       -- Release probing resources if probing.
       forM_ (remoteProbing vst) id
+      -- Must shut down the socket here, so that the other end will realize
+      -- we lost the connection
+      tryShutdownSocketBoth (remoteSocket vst)
       let code     = EventConnectionLost (remoteAddress theirEndPoint)
           err      = TransportError code (show ex)
       qdiscEnqueue' (localQueue ourEndPoint) (localAddress ourEndPoint) $ ErrorEvent err
