@@ -17,6 +17,7 @@ import Network.Transport.TCP ( createTransport
                              , createTransportExposeInternals
                              , TransportInternals(..)
                              , encodeEndPointAddress
+                             , decodeEndPointAddress
                              , defaultTCPParameters
                              , LightweightConnectionId
                              )
@@ -64,6 +65,15 @@ import qualified Network.Socket as N
   , AddrInfo
   , shutdown
   , ShutdownCmd(ShutdownSend)
+  , SockAddr(..)
+  , SocketType(Stream)
+  , AddrInfo(..)
+  , getAddrInfo
+  , defaultHints
+  , defaultProtocol
+  , socket
+  , connect
+  , close
   )
 
 #ifdef USE_MOCK_NETWORK
@@ -834,6 +844,48 @@ testUseRandomPort = do
      putMVar testDone ()
    takeMVar testDone
 
+-- | Ensure that an end point closes up OK even if the peer disobeys the
+--   protocol.
+testCloseEndPoint :: IO ()
+testCloseEndPoint = do
+
+  serverAddress <- newEmptyMVar
+  serverFinished <- newEmptyMVar
+
+  -- A server which accepts one connection and then attempts to close the
+  -- end point.
+  forkTry $ do
+    Right transport <- createTransport "127.0.0.1" "0" defaultTCPParameters
+    Right ep <- newEndPoint transport
+    putMVar serverAddress (address ep)
+    ConnectionOpened _ _ _ <- receive ep
+    Just () <- timeout 5000000 (closeEndPoint ep)
+    putMVar serverFinished ()
+    return ()
+
+  -- A nefarious client which connects to the server then stops responding.
+  forkTry $ do
+    Just (hostName, serviceName, endPointId) <- decodeEndPointAddress <$> readMVar serverAddress
+    addr:_ <- N.getAddrInfo (Just N.defaultHints) (Just hostName) (Just serviceName)
+    sock <- N.socket (N.addrFamily addr) N.Stream N.defaultProtocol
+    N.connect sock (N.addrAddress addr)
+    sendMany sock [
+        encodeWord32 endPointId
+      -- Our addres... we'll just make it up.
+      -- TODO there are plans to verify peer addresses, and also plans to
+      -- support peers which do not know their external address (due to NAT
+      -- perhaps). Update this test to use that feature once it's here.
+      , encodeWord32 5
+      , "hello"
+      -- Create a lightweight connection.
+      , encodeWord32 (encodeControlHeader CreatedNewConnection)
+      , encodeWord32 1024
+      ]
+    readMVar serverFinished
+    N.close sock
+
+  readMVar serverFinished
+
 main :: IO ()
 main = do
   tcpResult <- tryIO $ runTests
@@ -850,6 +902,7 @@ main = do
            , ("Reconnect",              testReconnect)
            , ("UnidirectionalError",    testUnidirectionalError)
            , ("InvalidCloseConnection", testInvalidCloseConnection)
+           , ("CloseEndPoint",          testCloseEndPoint)
            ]
   -- Run the generic tests even if the TCP specific tests failed..
   testTransport (either (Left . show) (Right) <$>
