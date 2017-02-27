@@ -24,8 +24,6 @@ module Network.Transport.TCP
   , createTransportExposeInternals
   , TransportInternals(..)
   , EndPointId
-  , encodeEndPointAddress
-  , decodeEndPointAddress
   , ControlHeader(..)
   , ConnectionRequestResponse(..)
   , firstNonReservedLightweightConnectionId
@@ -59,6 +57,10 @@ import Network.Transport.TCP.Internal
   , recvWord32
   , encodeWord32
   , tryCloseSocket
+  , decodeSockAddr
+  , EndPointId
+  , encodeEndPointAddress
+  , decodeEndPointAddress
   )
 import Network.Transport.Internal
   ( prependLength
@@ -141,7 +143,6 @@ import Control.Exception
 import Data.IORef (IORef, newIORef, writeIORef, readIORef, writeIORef)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS (concat)
-import qualified Data.ByteString.Char8 as BSC (pack, unpack)
 import Data.Bits (shiftL, (.|.))
 import Data.Maybe (isJust)
 import Data.Word (Word32)
@@ -438,9 +439,6 @@ data ValidRemoteEndPointState = ValidRemoteEndPointState
   ,  remoteProbing       :: Maybe (IO ())
   ,  remoteSendLock      :: !(MVar ())
   }
-
--- | Local identifier for an endpoint within this transport
-type EndPointId = Word32
 
 -- | Pair of local and a remote endpoint (for conciseness in signatures)
 type EndPointPair = (LocalEndPoint, RemoteEndPoint)
@@ -864,8 +862,25 @@ handleConnectionRequest transport (sock, sockAddr) = handle handleException $ do
       N.setSocketOption sock N.KeepAlive 1
     forM_ (tcpUserTimeout $ transportParams transport) $
       N.setSocketOption sock N.UserTimeout
+    -- Get the OS-determined host and port.
+    (actualHost, actualPort) <-
+      decodeSockAddr sockAddr >>=
+        maybe (throwIO (userError "handleConnectionRequest: invalid socket address")) return
+    -- Receive our EndPointId from the peer.
     ourEndPointId <- recvWord32 sock
+    -- Let the peer tell us their EndPointAddress.
     theirAddress  <- EndPointAddress . BS.concat <$> recvWithLength sock
+    (theirHost, theirPort, theirEndPointId)
+      <- maybe (throwIO (userError "handleConnectionRequest: peer gave malformed address"))
+               return
+               (decodeEndPointAddress theirAddress)
+    -- If the OS-determined host doesn't match the host that the peer gave us,
+    -- then we have no choice but to reject the connection. It's because we
+    -- use the EndPointAddress to key the remote end points (localConnections)
+    -- and we don't want to allow a peer to deny service to other peers by
+    -- claiming to have their host and port.
+    unless (theirHost == actualHost) $ do
+      throwIO (userError "handleConnectionRequest: reported host does not match actual host")
     let ourAddress = encodeEndPointAddress (transportHost transport)
                                            (transportPort transport)
                                            ourEndPointId
@@ -1786,47 +1801,12 @@ socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay kee
     failed                = TransportError ConnectFailed . show
     timeoutError          = TransportError ConnectTimeout "Timed out"
 
--- | Encode end point address
-encodeEndPointAddress :: N.HostName
-                      -> N.ServiceName
-                      -> EndPointId
-                      -> EndPointAddress
-encodeEndPointAddress host port ix = EndPointAddress . BSC.pack $
-  host ++ ":" ++ port ++ ":" ++ show ix
-
--- | Decode end point address
-decodeEndPointAddress :: EndPointAddress
-                      -> Maybe (N.HostName, N.ServiceName, EndPointId)
-decodeEndPointAddress (EndPointAddress bs) =
-  case splitMaxFromEnd (== ':') 2 $ BSC.unpack bs of
-    [host, port, endPointIdStr] ->
-      case reads endPointIdStr of
-        [(endPointId, "")] -> Just (host, port, endPointId)
-        _                  -> Nothing
-    _ ->
-      Nothing
-
 -- | Construct a ConnectionId
 createConnectionId :: HeavyweightConnectionId
                    -> LightweightConnectionId
                    -> ConnectionId
 createConnectionId hcid lcid =
   (fromIntegral hcid `shiftL` 32) .|. fromIntegral lcid
-
--- | @spltiMaxFromEnd p n xs@ splits list @xs@ at elements matching @p@,
--- returning at most @p@ segments -- counting from the /end/
---
--- > splitMaxFromEnd (== ':') 2 "ab:cd:ef:gh" == ["ab:cd", "ef", "gh"]
-splitMaxFromEnd :: (a -> Bool) -> Int -> [a] -> [[a]]
-splitMaxFromEnd p = \n -> go [[]] n . reverse
-  where
-    -- go :: [[a]] -> Int -> [a] -> [[a]]
-    go accs         _ []     = accs
-    go ([]  : accs) 0 xs     = reverse xs : accs
-    go (acc : accs) n (x:xs) =
-      if p x then go ([] : acc : accs) (n - 1) xs
-             else go ((x : acc) : accs) n xs
-    go _ _ _ = error "Bug in splitMaxFromEnd"
 
 --------------------------------------------------------------------------------
 -- Functions from TransportInternals                                          --
