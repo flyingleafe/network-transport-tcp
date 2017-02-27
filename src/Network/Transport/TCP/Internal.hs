@@ -48,6 +48,7 @@ import qualified Network.Socket as N
   , accept
   , sClose
   , socketPort
+  , SockAddr
   )
 
 #ifdef USE_MOCK_NETWORK
@@ -150,7 +151,8 @@ forkServer :: N.HostName               -- ^ Host
            -> Int                      -- ^ Backlog (maximum number of queued connections)
            -> Bool                     -- ^ Set ReuseAddr option?
            -> (SomeException -> IO ()) -- ^ Termination handler
-           -> (N.Socket -> IO ())      -- ^ Request handler
+           -> ((N.Socket, N.SockAddr) -> IO ())
+              -- ^ Request handler
            -> IO (N.ServiceName, ThreadId)
 forkServer host port backlog reuseAddr terminationHandler requestHandler = do
     -- Resolve the specified address. By specification, getAddrInfo will never
@@ -177,7 +179,7 @@ forkServer host port backlog reuseAddr terminationHandler requestHandler = do
     acceptRequest :: N.Socket -> IO ()
     acceptRequest sock = bracketOnError (N.accept sock)
                                         (tryCloseSocket . fst)
-                                        (requestHandler . fst)
+                                        (requestHandler)
 
 -- | Read a length and then a payload of that length
 recvWithLength :: N.Socket -> IO [ByteString]
