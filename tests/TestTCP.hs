@@ -880,7 +880,7 @@ testCloseEndPoint = do
   -- A server which accepts one connection and then attempts to close the
   -- end point.
   forkTry $ do
-    Right transport <- createTransport "127.0.0.1" "0" defaultTCPParameters
+    Right transport <- createTransport "127.0.0.1" "0" ((,) "127.0.0.1") defaultTCPParameters
     Right ep <- newEndPoint transport
     putMVar serverAddress (address ep)
     ConnectionOpened _ _ _ <- receive ep
