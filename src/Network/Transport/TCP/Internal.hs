@@ -11,7 +11,7 @@ module Network.Transport.TCP.Internal
 import Prelude hiding (catch)
 #endif
 
-import Network.Transport.Internal (decodeInt32, void, tryIO, forkIOWithUnmask)
+import Network.Transport.Internal (decodeWord32, void, tryIO, forkIOWithUnmask)
 
 #ifdef USE_MOCK_NETWORK
 import qualified Network.Transport.TCP.Mock.Socket as N
@@ -113,7 +113,7 @@ recvWithLength sock = recvInt32 sock >>= recvExact sock
 
 -- | Receive a 32-bit integer
 recvInt32 :: Num a => N.Socket -> IO a
-recvInt32 sock = decodeInt32 . BS.concat <$> recvExact sock 4
+recvInt32 sock = fromIntegral . decodeWord32 . BS.concat <$> recvExact sock 4
 
 -- | Close a socket, ignoring I/O exceptions
 tryCloseSocket :: N.Socket -> IO ()

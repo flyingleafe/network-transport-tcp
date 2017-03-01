@@ -54,7 +54,7 @@ import Network.Transport.TCP.Internal
   , tryCloseSocket
   )
 import Network.Transport.Internal
-  ( encodeInt32
+  ( encodeWord32
   , prependLength
   , mapIOException
   , tryIO
@@ -1936,6 +1936,13 @@ localEndPointAt addr = localEndPoints >>> DAC.mapMaybe addr
 
 localConnectionTo :: EndPointAddress -> Accessor ValidLocalEndPointState (Maybe RemoteEndPoint)
 localConnectionTo addr = localConnections >>> DAC.mapMaybe addr
+
+-------------------------------------------------------------------------------
+-- Helpers                                                                   --
+-------------------------------------------------------------------------------
+
+encodeInt32 :: Enum a => a -> ByteString
+encodeInt32 = encodeWord32 . fromIntegral . fromEnum
 
 -------------------------------------------------------------------------------
 -- Debugging                                                                 --
